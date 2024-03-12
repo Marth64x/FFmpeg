@@ -456,7 +456,7 @@ static void roll_up(CCaptionSubContext *ctx)
 
 static int capture_screen(CCaptionSubContext *ctx)
 {
-    int i, j, tab = 0;
+    int i, j, tab = 0, seen_row = 0;
     struct Screen *screen = ctx->screen + ctx->active_screen;
     enum cc_font prev_font = CCFONT_REGULAR;
     enum cc_color_code prev_color = CCCOL_WHITE;
@@ -496,7 +496,11 @@ static int capture_screen(CCaptionSubContext *ctx)
 
             x = ASS_DEFAULT_PLAYRESX * (0.1 + 0.0250 * j);
             y = ASS_DEFAULT_PLAYRESY * (0.1 + 0.0533 * i);
-            av_bprintf(&ctx->buffer[bidx], "{\\an7}{\\pos(%d,%d)}", x, y);
+
+            if (!seen_row) {
+                av_bprintf(&ctx->buffer[bidx], "{\\an7}{\\pos(%d,%d)}", x, y);
+                seen_row = 1;
+            }
 
             for (; j < SCREEN_COLUMNS; j++) {
                 const char *e_tag = "", *s_tag = "", *c_tag = "", *b_tag = "";
