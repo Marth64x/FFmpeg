@@ -91,7 +91,7 @@ enum cc_charset {
         ENTRY(0x36, "\u00a3")                            \
         ENTRY(0x37, "\u266a")                            \
         ENTRY(0x38, "\u00e0")                            \
-        ENTRY(0x39, "\u00A0")                            \
+        ENTRY(0x39, "\u00a0")                            \
         ENTRY(0x3a, "\u00e8")                            \
         ENTRY(0x3b, "\u00e2")                            \
         ENTRY(0x3c, "\u00ea")                            \
@@ -471,7 +471,8 @@ static int capture_screen(CCaptionSubContext *ctx)
             const char *row = screen->characters[i];
             const char *charset = screen->charsets[i];
             j = 0;
-            while (row[j] == ' ' && charset[j] == CCSET_BASIC_AMERICAN)
+            while ((row[j] == ' '  && charset[j] == CCSET_BASIC_AMERICAN) ||
+                   (row[j] == 0x39 && charset[j] == CCSET_SPECIAL_AMERICAN))
                 j++;
             if (!tab || j < tab)
                 tab = j;
@@ -491,7 +492,9 @@ static int capture_screen(CCaptionSubContext *ctx)
             j = 0;
 
             /* skip leading space */
-            while (row[j] == ' ' && charset[j] == CCSET_BASIC_AMERICAN && j < tab)
+            while (j < tab &&
+                   (row[j] == ' '  && charset[j] == CCSET_BASIC_AMERICAN) ||
+                   (row[j] == 0x39 && charset[j] == CCSET_SPECIAL_AMERICAN))
                 j++;
 
             x = ASS_DEFAULT_PLAYRESX * (0.1 + 0.0250 * j);
