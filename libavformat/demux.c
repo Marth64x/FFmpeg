@@ -1306,6 +1306,7 @@ static int codec_close(FFStream *sti)
     if (ret < 0)
         goto fail;
 
+    avctx_new->properties   = sti->avctx->properties;
     avctx_new->pkt_timebase = sti->avctx->pkt_timebase;
 
 #if FF_API_TICKS_PER_FRAME
