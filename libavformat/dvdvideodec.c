@@ -173,40 +173,28 @@ typedef struct DVDVideoDemuxContext {
     int                         subdemux_reset;     /* signal that subdemuxer should be reset */
 } DVDVideoDemuxContext;
 
-static void dvdvideo_libdvdread_log(void *opaque, dvd_logger_level_t level,
-                                    const char *msg, va_list msg_va)
-{
-    AVFormatContext *s = opaque;
-    char msg_buf[DVDVIDEO_LIBDVDX_LOG_BUFFER_SIZE];
-    int lavu_level = AV_LOG_DEBUG;
+#define LIBDVDX_LOG_CALLBACK(X, CB_TYPE, LEVEL_TYPE, LEVEL_PREFIX) \
+    static void dvdvideo_##X##_log(void *o, LEVEL_TYPE level, const char *msg, va_list msg_va) \
+    { \
+        AVFormatContext *s = o; \
+        char msg_buf[DVDVIDEO_LIBDVDX_LOG_BUFFER_SIZE]; \
+        int lavu_level = AV_LOG_DEBUG; \
+        \
+        vsnprintf(msg_buf, sizeof(msg_buf), msg, msg_va); \
+        \
+        if (level == LEVEL_PREFIX##_ERROR) \
+            lavu_level = AV_LOG_ERROR; \
+        else if (level == LEVEL_PREFIX##_WARN && \
+                 !av_strstart(msg, "Language", NULL)) /* muffle menus with invalid language */ \
+            lavu_level = AV_LOG_WARNING; \
+        \
+        av_log(s, lavu_level, #X": %s\n", msg_buf); \
+    } \
+    \
+    static const CB_TYPE dvdvideo_##X##_log_cb = (CB_TYPE) { .pf_log = dvdvideo_##X##_log }; \
 
-    vsnprintf(msg_buf, sizeof(msg_buf), msg, msg_va);
-
-    if (level == DVD_LOGGER_LEVEL_ERROR)
-        lavu_level = AV_LOG_ERROR;
-    else if (level == DVD_LOGGER_LEVEL_WARN)
-        lavu_level = AV_LOG_WARNING;
-
-    av_log(s, lavu_level, "libdvdread: %s\n", msg_buf);
-}
-
-static void dvdvideo_libdvdnav_log(void *opaque, dvdnav_logger_level_t level,
-                                   const char *msg, va_list msg_va)
-{
-    AVFormatContext *s = opaque;
-    char msg_buf[DVDVIDEO_LIBDVDX_LOG_BUFFER_SIZE];
-    int lavu_level = AV_LOG_DEBUG;
-
-    vsnprintf(msg_buf, sizeof(msg_buf), msg, msg_va);
-
-    if (level == DVDNAV_LOGGER_LEVEL_ERROR)
-        lavu_level = AV_LOG_ERROR;
-    /* some discs have invalid language codes set for menus, which throws noisy warnings */
-    else if (level == DVDNAV_LOGGER_LEVEL_WARN && !av_strstart(msg, "Language", NULL))
-        lavu_level = AV_LOG_WARNING;
-
-    av_log(s, lavu_level, "libdvdnav: %s\n", msg_buf);
-}
+LIBDVDX_LOG_CALLBACK(libdvdread, dvd_logger_cb,    dvd_logger_level_t,    DVD_LOGGER_LEVEL)
+LIBDVDX_LOG_CALLBACK(libdvdnav,  dvdnav_logger_cb, dvdnav_logger_level_t, DVDNAV_LOGGER_LEVEL)
 
 static void dvdvideo_ifo_close(AVFormatContext *s)
 {
@@ -226,11 +214,9 @@ static int dvdvideo_ifo_open(AVFormatContext *s)
 {
     DVDVideoDemuxContext *c = s->priv_data;
 
-    dvd_logger_cb dvdread_log_cb;
     title_info_t title_info;
 
-    dvdread_log_cb = (dvd_logger_cb) { .pf_log = dvdvideo_libdvdread_log };
-    c->dvdread = DVDOpen2(s, &dvdread_log_cb, s->url);
+    c->dvdread = DVDOpen2(s, &dvdvideo_libdvdread_log_cb, s->url);
 
     if (!c->dvdread) {
         av_log(s, AV_LOG_ERROR, "Unable to open the DVD-Video structure\n");
@@ -516,15 +502,13 @@ static int dvdvideo_play_open(AVFormatContext *s, DVDVideoPlaybackState *state)
 {
     DVDVideoDemuxContext *c = s->priv_data;
 
-    dvdnav_logger_cb dvdnav_log_cb;
     dvdnav_status_t dvdnav_open_status;
     int32_t disc_region_mask;
     int32_t player_region_mask;
     int cur_title, cur_pgcn, cur_pgn;
     pgc_t *pgc;
 
-    dvdnav_log_cb = (dvdnav_logger_cb) { .pf_log = dvdvideo_libdvdnav_log };
-    dvdnav_open_status = dvdnav_open2(&state->dvdnav, s, &dvdnav_log_cb, s->url);
+    dvdnav_open_status = dvdnav_open2(&state->dvdnav, s, &dvdvideo_libdvdnav_log_cb, s->url);
 
     if (!state->dvdnav                                                          ||
         dvdnav_open_status != DVDNAV_STATUS_OK                                  ||
