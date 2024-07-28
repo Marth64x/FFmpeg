@@ -58,7 +58,7 @@
 #define DVDVIDEO_MAX_PS_SEARCH_BLOCKS                   128
 #define DVDVIDEO_BLOCK_SIZE                             2048
 #define DVDVIDEO_TIME_BASE_Q                            (AVRational) { 1, 90000 }
-#define DVDVIDEO_PTS_WRAP_BITS                          64 /* VOBUs use 32 (PES allows 33) */
+#define DVDVIDEO_PTS_WRAP_BITS                          32 /* VOBUs use 32 (PES allows 33) */
 #define DVDVIDEO_LIBDVDX_LOG_BUFFER_SIZE                1024
 
 #define PCI_START_BYTE                                  45 /* complement dvdread's DSI_START_BYTE */
@@ -116,8 +116,9 @@ typedef struct DVDVideoPlaybackState {
     int                         pgc_nb_pg_est;      /* number of PGs as reported by IFOs */
     int                         pgcn;               /* ID of the PGC we are playing */
     int                         pgn;                /* ID of the PG we are in now */
+    int                         ptm_discont;        /* signal that a PTM discontinuity occurred */
+    int64_t                     ptm_offset;         /* PTM discontinuity offset (as NAV value) */
     int                         ptt;                /* ID of the chapter we are in now */
-    int64_t                     ts_offset;          /* PTS discontinuity offset (ex. VOB change) */
     uint32_t                    vobu_duration;      /* duration of the current VOBU */
     uint32_t                    vobu_e_ptm;         /* end PTM of the current VOBU */
     int                         vtsn;               /* ID of the active VTS (video title set) */
@@ -164,10 +165,11 @@ typedef struct DVDVideoDemuxContext {
 
     /* playback control */
     int64_t                     first_pts;          /* the PTS of the first video keyframe */
-    int                         play_end;           /* signal EOF to the parent demuxer */
-    DVDVideoPlaybackState       play_state;         /* the active playback state */
     int                         play_started;       /* signal that playback has started */
-    int                         segment_started;    /* signal that subdemuxer is on a segment */
+    DVDVideoPlaybackState       play_state;         /* the active playback state */
+    int64_t                     pts_offset;         /* PTS discontinuity offset (ex. VOB change) */
+    int                         seek_warned;        /* signal that we warned about seeking limits */
+    int                         subdemux_reset;     /* signal that subdemuxer should be reset */
 } DVDVideoDemuxContext;
 
 static void dvdvideo_libdvdread_log(void *opaque, dvd_logger_level_t level,
@@ -344,7 +346,7 @@ static int dvdvideo_menu_open(AVFormatContext *s, DVDVideoPlaybackState *state)
     }
 
     /* make sure the PGC is valid */
-    state->pgcn          = c->opt_pgc - 1;
+    state->pgcn          = c->opt_pgc;
     state->pgc           = pgci_ut->lu[c->opt_menu_lu - 1].pgcit->pgci_srp[c->opt_pgc - 1].pgc;
     if (!state->pgc || !state->pgc->program_map || !state->pgc->cell_playback) {
         av_log(s, AV_LOG_ERROR, "Invalid PGC structure for menu [LU %d, PGC %d]\n",
@@ -390,13 +392,15 @@ static int dvdvideo_menu_open(AVFormatContext *s, DVDVideoPlaybackState *state)
 }
 
 static int dvdvideo_menu_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState *state,
-                                       uint8_t *buf, int buf_size,
-                                       void (*flush_cb)(AVFormatContext *s))
+                                       uint8_t *buf, int buf_size, int *p_is_nav_packet)
 {
     int64_t blocks_read                   = 0;
     uint8_t read_buf[DVDVIDEO_BLOCK_SIZE] = {0};
     pci_t pci                             = (pci_t) {0};
     dsi_t dsi                             = (dsi_t) {0};
+
+    (*p_is_nav_packet)  = 0;
+    state->ptm_discont  = 0;
 
     if (buf_size != DVDVIDEO_BLOCK_SIZE) {
         av_log(s, AV_LOG_ERROR, "Invalid buffer size (expected=%d actual=%d)\n",
@@ -463,10 +467,8 @@ static int dvdvideo_menu_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
 
         if (state->in_pgc) {
             if (state->vobu_e_ptm != pci.pci_gi.vobu_s_ptm) {
-                if (flush_cb)
-                    flush_cb(s);
-
-                state->ts_offset += state->vobu_e_ptm - pci.pci_gi.vobu_s_ptm;
+                state->ptm_discont  = 1;
+                state->ptm_offset  += state->vobu_e_ptm - pci.pci_gi.vobu_s_ptm;
             }
         } else {
             state->in_pgc        = 1;
@@ -474,13 +476,17 @@ static int dvdvideo_menu_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
         }
 
         state->vobu_e_ptm        = pci.pci_gi.vobu_e_ptm;
+        state->vobu_duration     = pci.pci_gi.vobu_e_ptm - pci.pci_gi.vobu_s_ptm;
 
         av_log(s, AV_LOG_DEBUG, "NAV packet: sector=%d "
-                                "vobu_s_ptm=%d vobu_e_ptm=%d ts_offset=%" PRId64 "\n",
+                                "vobu_s_ptm=%d vobu_e_ptm=%d ptm_offset=%" PRId64 "\n",
                                 dsi.dsi_gi.nv_pck_lbn,
-                                pci.pci_gi.vobu_s_ptm, pci.pci_gi.vobu_e_ptm, state->ts_offset);
+                                pci.pci_gi.vobu_s_ptm, pci.pci_gi.vobu_e_ptm, state->ptm_offset);
 
-        return FFERROR_REDO;
+
+        (*p_is_nav_packet) = 1;
+
+        return DVDVIDEO_BLOCK_SIZE;
     }
 
     /* we are in the middle of a VOBU, so pass on the PS packet */
@@ -610,9 +616,7 @@ end_dvdnav_error:
 }
 
 static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState *state,
-                                       uint8_t *buf, int buf_size,
-                                       int *p_nav_event,
-                                       void (*flush_cb)(AVFormatContext *s))
+                                       uint8_t *buf, int buf_size, int *p_is_nav_packet)
 {
     DVDVideoDemuxContext *c = s->priv_data;
 
@@ -625,6 +629,9 @@ static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
     int cur_title, cur_pgcn, cur_pgn, cur_angle, cur_title_unused, cur_ptt, cur_nb_angles;
     pci_t *e_pci;
     dsi_t *e_dsi;
+
+    (*p_is_nav_packet)  = 0;
+    state->ptm_discont  = 0;
 
     if (buf_size != DVDVIDEO_BLOCK_SIZE) {
         av_log(s, AV_LOG_ERROR, "Invalid buffer size (expected=%d actual=%d)\n",
@@ -769,16 +776,14 @@ static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
                     state->in_ps = 1;
                 } else {
                     if (state->vobu_e_ptm != e_pci->pci_gi.vobu_s_ptm) {
-                        if (flush_cb)
-                            flush_cb(s);
-
-                        state->ts_offset += state->vobu_e_ptm - e_pci->pci_gi.vobu_s_ptm;
+                        state->ptm_discont = 1;
+                        state->ptm_offset  += state->vobu_e_ptm - e_pci->pci_gi.vobu_s_ptm;
                     }
                 }
 
                 state->vobu_e_ptm = e_pci->pci_gi.vobu_e_ptm;
 
-                (*p_nav_event) = nav_event;
+                (*p_is_nav_packet) = 1;
 
                 return nav_len;
             case DVDNAV_BLOCK_OK:
@@ -808,8 +813,6 @@ static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
                     av_log(s, AV_LOG_WARNING, "Unexpected PG change (expected=%d actual=%d); "
                                               "this could be due to a missed NAV packet\n",
                                               state->pgn, cur_pgn);
-
-                (*p_nav_event) = nav_event;
 
                 return nav_len;
             case DVDNAV_WAIT:
@@ -908,7 +911,7 @@ static int dvdvideo_chapters_setup_preindex(AVFormatContext *s)
     DVDVideoPlaybackState state = {0};
 
     uint8_t nav_buf[DVDVIDEO_BLOCK_SIZE];
-    int nav_event;
+    int is_nav_packet;
 
     if (c->opt_chapter_start == c->opt_chapter_end)
         return ret;
@@ -924,11 +927,11 @@ static int dvdvideo_chapters_setup_preindex(AVFormatContext *s)
 
     while (!(interrupt = ff_check_interrupt(&s->interrupt_callback))) {
         ret = dvdvideo_play_next_ps_block(s, &state, nav_buf, DVDVIDEO_BLOCK_SIZE,
-                                          &nav_event, NULL);
+                                          &is_nav_packet);
         if (ret < 0 && ret != AVERROR_EOF)
             goto end_close;
 
-        if (nav_event != DVDNAV_NAV_PACKET && ret != AVERROR_EOF)
+        if (!is_nav_packet && ret != AVERROR_EOF)
             continue;
 
         if (state.ptt == last_ptt) {
@@ -1420,46 +1423,40 @@ static int dvdvideo_subp_stream_add_all(AVFormatContext *s)
     return 0;
 }
 
-static void dvdvideo_subdemux_flush(AVFormatContext *s)
-{
-    DVDVideoDemuxContext *c = s->priv_data;
-
-    if (!c->segment_started)
-        return;
-
-    av_log(s, AV_LOG_DEBUG, "flushing sub-demuxer\n");
-    avio_flush(&c->mpeg_pb.pub);
-    ff_read_frame_flush(c->mpeg_ctx);
-    c->segment_started = 0;
-}
-
 static int dvdvideo_subdemux_read_data(void *opaque, uint8_t *buf, int buf_size)
 {
     AVFormatContext *s = opaque;
     DVDVideoDemuxContext *c = s->priv_data;
 
-    int ret = 0;
-    int nav_event;
-
-    if (c->play_end)
-        return AVERROR_EOF;
+    int ret;
+    int is_nav_packet;
 
     if (c->opt_menu)
-        ret = dvdvideo_menu_next_ps_block(s, &c->play_state, buf, buf_size,
-                                          dvdvideo_subdemux_flush);
+        ret = dvdvideo_menu_next_ps_block(s, &c->play_state, buf, buf_size, &is_nav_packet);
     else
-        ret = dvdvideo_play_next_ps_block(opaque, &c->play_state, buf, buf_size,
-                                          &nav_event, dvdvideo_subdemux_flush);
+        ret = dvdvideo_play_next_ps_block(s, &c->play_state, buf, buf_size, &is_nav_packet);
 
-    if (ret == AVERROR_EOF) {
-        c->mpeg_pb.pub.eof_reached = 1;
-        c->play_end = 1;
+    if (ret < 0)
+        goto subdemux_eof;
 
-        return AVERROR_EOF;
+    if (is_nav_packet) {
+        if (c->play_state.ptm_discont) {
+            c->subdemux_reset = 1;
+
+            ret = AVERROR_EOF;
+            goto subdemux_eof;
+        }
+
+        return FFERROR_REDO;
     }
 
-    if (ret >= 0 && nav_event == DVDNAV_NAV_PACKET)
-        return FFERROR_REDO;
+    return ret;
+
+subdemux_eof:
+    c->mpeg_pb.pub.eof_reached = 1;
+    c->mpeg_pb.pub.error       = ret;
+    c->mpeg_pb.pub.read_packet = NULL;
+    c->mpeg_pb.pub.buf_end     = c->mpeg_pb.pub.buf_ptr = c->mpeg_pb.pub.buffer;
 
     return ret;
 }
@@ -1469,7 +1466,9 @@ static void dvdvideo_subdemux_close(AVFormatContext *s)
     DVDVideoDemuxContext *c = s->priv_data;
 
     av_freep(&c->mpeg_pb.pub.buffer);
+    memset(&c->mpeg_pb, 0x00, sizeof(c->mpeg_pb));
     avformat_close_input(&c->mpeg_ctx);
+    c->mpeg_ctx = NULL;
 }
 
 static int dvdvideo_subdemux_open(AVFormatContext *s)
@@ -1501,10 +1500,21 @@ static int dvdvideo_subdemux_open(AVFormatContext *s)
     c->mpeg_ctx->max_analyze_duration = 0;
     c->mpeg_ctx->interrupt_callback = s->interrupt_callback;
     c->mpeg_ctx->pb = &c->mpeg_pb.pub;
-    c->mpeg_ctx->correct_ts_overflow = 0;
-    c->mpeg_ctx->io_open = NULL;
 
     return avformat_open_input(&c->mpeg_ctx, "", &ff_mpegps_demuxer.p, NULL);
+}
+
+static int dvdvideo_subdemux_reset(AVFormatContext *s)
+{
+    int ret;
+
+    av_log(s, AV_LOG_DEBUG, "resetting sub-demuxer\n");
+
+    dvdvideo_subdemux_close(s);
+    if ((ret = dvdvideo_subdemux_open(s)) < 0)
+        return ret;
+
+    return 0;
 }
 
 static int dvdvideo_read_header(AVFormatContext *s)
@@ -1604,72 +1614,64 @@ static int dvdvideo_read_packet(AVFormatContext *s, AVPacket *pkt)
     DVDVideoDemuxContext *c = s->priv_data;
 
     int ret;
-    enum AVMediaType st_type;
-    int found_stream = 0;
-
-    if (c->play_end)
-        return AVERROR_EOF;
+    int st_matched = 0;
+    AVStream *st_subdemux;
 
     ret = av_read_frame(c->mpeg_ctx, pkt);
+    if (ret < 0) {
+        if (c->subdemux_reset) {
+            c->subdemux_reset = 0;
+            c->pts_offset     = c->play_state.ptm_offset;
 
-    if (ret < 0)
+            if ((ret = dvdvideo_subdemux_reset(s)) < 0)
+                return ret;
+
+            return FFERROR_REDO;
+        }
+
         return ret;
+    }
 
-    if (!c->segment_started)
-        c->segment_started = 1;
-
-    st_type = c->mpeg_ctx->streams[pkt->stream_index]->codecpar->codec_type;
+    st_subdemux = c->mpeg_ctx->streams[pkt->stream_index];
 
     /* map the subdemuxer stream to the parent demuxer's stream (by startcode) */
     for (int i = 0; i < s->nb_streams; i++) {
-        if (s->streams[i]->id == c->mpeg_ctx->streams[pkt->stream_index]->id) {
+        if (s->streams[i]->id == st_subdemux->id) {
             pkt->stream_index = s->streams[i]->index;
-            found_stream = 1;
+            st_matched = 1;
             break;
         }
     }
 
-    if (!found_stream) {
-        av_log(s, AV_LOG_DEBUG, "discarding frame with stream that was not in IFO headers "
-                                "(stream id=%d)\n", c->mpeg_ctx->streams[pkt->stream_index]->id);
-
-        return FFERROR_REDO;
-    }
+    if (!st_matched)
+        goto discard;
 
     if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE) {
         if (!c->play_started) {
-            /* try to start at the beginning of a GOP */
-            if (st_type != AVMEDIA_TYPE_VIDEO || !(pkt->flags & AV_PKT_FLAG_KEY)) {
-                av_log(s, AV_LOG_VERBOSE, "Discarding packet which is not a video keyframe or "
-                                          "with unset PTS/DTS at start\n");
-                return FFERROR_REDO;
-            }
-
             c->first_pts = pkt->pts;
             c->play_started = 1;
         }
 
-        pkt->pts += c->play_state.ts_offset - c->first_pts;
-        pkt->dts += c->play_state.ts_offset - c->first_pts;
-
-        if (pkt->pts < 0) {
-            av_log(s, AV_LOG_VERBOSE, "Discarding packet with negative PTS (st=%d pts=%" PRId64 "), "
-                                      "this is OK at start of playback\n",
-                                      pkt->stream_index, pkt->pts);
-
-            return FFERROR_REDO;
-        }
+        pkt->pts += c->pts_offset - c->first_pts;
+        pkt->dts += c->pts_offset - c->first_pts;
     } else {
-        av_log(s, AV_LOG_WARNING, "Unset PTS or DTS @ st=%d pts=%" PRId64 " dts=%" PRId64 "\n",
-                                  pkt->stream_index, pkt->pts, pkt->dts);
+        av_log(s, AV_LOG_WARNING, "Received packet with unset PTS or DTS\n");
     }
 
     av_log(s, AV_LOG_TRACE, "st=%d pts=%" PRId64 " dts=%" PRId64 " "
-                            "ts_offset=%" PRId64 " first_pts=%" PRId64 "\n",
+                            "pts_offset=%" PRId64 " first_pts=%" PRId64 "\n",
                             pkt->stream_index, pkt->pts, pkt->dts,
-                            c->play_state.ts_offset, c->first_pts);
+                            c->pts_offset);
 
-    return c->play_end ? AVERROR_EOF : 0;
+    return 0;
+
+discard:
+    av_log(s, AV_LOG_VERBOSE, "Discarding packet @ st=%d pts=%" PRId64 " dts=%" PRId64 " "
+                              "st_matched=%d\n",
+                              st_matched ? pkt->stream_index : -1, pkt->pts, pkt->dts,
+                              st_matched);
+
+    return FFERROR_REDO;
 }
 
 static int dvdvideo_close(AVFormatContext *s)
