@@ -21,7 +21,7 @@
 /*
  * See doc/demuxers.texi for a high-level overview.
  *
- * The tactical approach is as follows:
+ * The tactical approach for title playback is as follows:
  * 1) Open the volume with dvdread
  * 2) Analyze the user-requested title and PGC coordinates in the IFO structures
  * 3) Request playback at the coordinates and chosen angle with dvdnav
@@ -565,8 +565,8 @@ static int dvdvideo_play_open(AVFormatContext *s, DVDVideoPlaybackState *state)
     }
 
     if (c->opt_trim && !dvdvideo_is_pgc_promising(s, pgc)) {
-        av_log(s, AV_LOG_ERROR, "Title %d, PGC %d looks empty (may consist of padding cells), "
-                                "if you want to try anyway, disable the -trim option\n",
+        av_log(s, AV_LOG_ERROR, "Title %d, PGC %d looks empty (may consist of padding cells); "
+                                "if you want to try anyway, disable the trim option\n",
                                 c->opt_title, state->pgcn);
 
         return AVERROR_INVALIDDATA;
@@ -757,7 +757,7 @@ static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
 
                 if (!state->in_ps) {
                     if (c->opt_trim && !dvdvideo_is_cell_promising(s, state->pgc, state->celln)) {
-                        av_log(s, AV_LOG_INFO, "Skipping padding cell #%d\n", state->celln);
+                        av_log(s, AV_LOG_INFO, "Trimming padding cell #%d\n", state->celln);
 
                         i = 0;
                         continue;
@@ -1175,8 +1175,7 @@ static int dvdvideo_audio_stream_analyze(AVFormatContext *s, audio_attr_t audio_
     if (audio_attr.application_mode == 1) {
         entry->disposition |= AV_DISPOSITION_KARAOKE;
 
-        av_log(s, AV_LOG_WARNING, "Extended karaoke metadata is not supported at this time "
-                                  "(stream id=%d)\n", startcode);
+        av_log(s, AV_LOG_WARNING, "Karaoke extensions not supported (stream id=%d)\n", startcode);
     }
 
     if (audio_attr.code_extension == 2)
@@ -1770,7 +1769,7 @@ static const AVOption dvdvideo_options[] = {
 };
 
 static const AVClass dvdvideo_class = {
-    .class_name = "DVD-Video demuxer",
+    .class_name = "dvdvideo",
     .item_name  = av_default_item_name,
     .option     = dvdvideo_options,
     .version    = LIBAVUTIL_VERSION_INT
