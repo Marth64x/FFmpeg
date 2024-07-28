@@ -110,6 +110,7 @@ typedef struct DVDVideoPlaybackState {
     int                         in_pgc;             /* if our navigator is in the PGC */
     int                         in_ps;              /* if our navigator is in the program stream */
     int                         in_vts;             /* if our navigator is in the VTS */
+    int                         is_seeking;         /* relax navigation path while seeking */
     int64_t                     nav_pts;            /* PTS according to IFO, not frame-accurate */
     uint64_t                    pgc_duration_est;   /* estimated duration as reported by IFO */
     uint64_t                    pgc_elapsed;        /* the elapsed time of the PGC, cell-relative */
@@ -722,7 +723,8 @@ static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
 
                         state->in_pgc = 1;
                     }
-                } else if (state->celln >= e_cell->cellN || state->pgn > cur_pgn) {
+                } else if (!state->is_seeking &&
+                           (state->celln >= e_cell->cellN || state->pgn > cur_pgn)) {
                     return AVERROR_EOF;
                 }
 
@@ -735,7 +737,7 @@ static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
                 if (!state->in_pgc)
                     continue;
 
-                if ((state->ptt > 0 && state->ptt > cur_ptt) ||
+                if ((!state->is_seeking && state->ptt > 0 && state->ptt > cur_ptt) ||
                     (c->opt_chapter_end > 0 && cur_ptt > c->opt_chapter_end)) {
                     return AVERROR_EOF;
                 }
@@ -807,12 +809,14 @@ static int dvdvideo_play_next_ps_block(AVFormatContext *s, DVDVideoPlaybackState
                     return AVERROR_INPUT_CHANGED;
                 }
 
-                memcpy(buf, &nav_buf, nav_len);
-
                 if (state->pgn != cur_pgn)
                     av_log(s, AV_LOG_WARNING, "Unexpected PG change (expected=%d actual=%d); "
                                               "this could be due to a missed NAV packet\n",
                                               state->pgn, cur_pgn);
+
+                memcpy(buf, &nav_buf, nav_len);
+
+                state->is_seeking = 0;
 
                 return nav_len;
             case DVDNAV_WAIT:
@@ -1659,17 +1663,17 @@ static int dvdvideo_read_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     av_log(s, AV_LOG_TRACE, "st=%d pts=%" PRId64 " dts=%" PRId64 " "
-                            "pts_offset=%" PRId64 " first_pts=%" PRId64 "\n",
+                            "pts_offset=%" PRId64 " first_pts=%" PRId64 " is_seeking=%d\n",
                             pkt->stream_index, pkt->pts, pkt->dts,
-                            c->pts_offset);
+                            c->pts_offset, c->first_pts, c->play_state.is_seeking);
 
     return 0;
 
 discard:
     av_log(s, AV_LOG_VERBOSE, "Discarding packet @ st=%d pts=%" PRId64 " dts=%" PRId64 " "
-                              "st_matched=%d\n",
+                              "st_matched=%d is_seeking=%d\n",
                               st_matched ? pkt->stream_index : -1, pkt->pts, pkt->dts,
-                              st_matched);
+                              st_matched, c->play_state.is_seeking);
 
     return FFERROR_REDO;
 }
@@ -1686,6 +1690,72 @@ static int dvdvideo_close(AVFormatContext *s)
         dvdvideo_play_close(s, &c->play_state);
 
     dvdvideo_ifo_close(s);
+
+    return 0;
+}
+
+static int dvdvideo_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp, int flags)
+{
+    DVDVideoDemuxContext *c = s->priv_data;
+    int     ret;
+    int64_t new_nav_pts;
+    pci_t*  new_nav_pci;
+    dsi_t*  new_nav_dsi;
+
+    if (c->opt_menu || c->opt_chapter_start > 1) {
+        av_log(s, AV_LOG_ERROR, "Seeking is not compatible with menus or chapter extraction\n");
+
+        return AVERROR_PATCHWELCOME;
+    }
+
+    if ((flags & AVSEEK_FLAG_BYTE))
+        return AVERROR(ENOSYS);
+
+    if (timestamp < 0)
+        return AVERROR(EINVAL);
+
+    if (!c->seek_warned) {
+        av_log(s, AV_LOG_WARNING, "Seeking is inherently unreliable and will result "
+                                  "in imprecise timecodes from this point\n");
+        c->seek_warned = 1;
+    }
+
+    /* XXX(PATCHWELCOME): use dvdnav_jump_to_sector_by_time(c->play_state.dvdnav, timestamp, 0)
+     * when it is available in a released version of libdvdnav; it is more accurate */
+    if (dvdnav_time_search(c->play_state.dvdnav, timestamp) != DVDNAV_STATUS_OK) {
+        av_log(s, AV_LOG_ERROR, "libdvdnav: seeking to %" PRId64 " failed\n", timestamp);
+
+        return AVERROR_EXTERNAL;
+    }
+
+    new_nav_pts = dvdnav_get_current_time   (c->play_state.dvdnav);
+    new_nav_pci = dvdnav_get_current_nav_pci(c->play_state.dvdnav);
+    new_nav_dsi = dvdnav_get_current_nav_dsi(c->play_state.dvdnav);
+
+    if (new_nav_pci == NULL || new_nav_dsi == NULL) {
+        av_log(s, AV_LOG_ERROR, "Invalid NAV packet after seeking\n");
+
+        return AVERROR_INVALIDDATA;
+    }
+
+    c->play_state.in_pgc      = 1;
+    c->play_state.in_ps       = 0;
+    c->play_state.is_seeking  = 1;
+    c->play_state.nav_pts     = timestamp;
+    c->play_state.ptm_offset  = timestamp;
+    c->play_state.ptm_discont = 0;
+    c->play_state.vobu_e_ptm  = new_nav_pci->pci_gi.vobu_s_ptm;
+
+    c->first_pts              = 0;
+    c->play_started           = 0;
+    c->pts_offset             = timestamp;
+    c->subdemux_reset         = 0;
+
+    if ((ret = dvdvideo_subdemux_reset(s)) < 0)
+        return ret;
+
+    av_log(s, AV_LOG_DEBUG, "seeking: requested_nav_pts=%" PRId64 " new_nav_pts=%" PRId64 "\n",
+                            timestamp, new_nav_pts);
 
     return 0;
 }
@@ -1718,11 +1788,12 @@ const FFInputFormat ff_dvdvideo_demuxer = {
     .p.name         = "dvdvideo",
     .p.long_name    = NULL_IF_CONFIG_SMALL("DVD-Video"),
     .p.priv_class   = &dvdvideo_class,
-    .p.flags        = AVFMT_NOFILE | AVFMT_SHOW_IDS | AVFMT_TS_DISCONT |
-                      AVFMT_NO_BYTE_SEEK | AVFMT_NOGENSEARCH | AVFMT_NOBINSEARCH,
+    .p.flags        = AVFMT_SHOW_IDS | AVFMT_TS_DISCONT   | AVFMT_SEEK_TO_PTS |
+                      AVFMT_NOFILE   | AVFMT_NO_BYTE_SEEK | AVFMT_NOGENSEARCH | AVFMT_NOBINSEARCH,
     .priv_data_size = sizeof(DVDVideoDemuxContext),
     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_close     = dvdvideo_close,
     .read_header    = dvdvideo_read_header,
-    .read_packet    = dvdvideo_read_packet
+    .read_packet    = dvdvideo_read_packet,
+    .read_seek      = dvdvideo_read_seek
 };
