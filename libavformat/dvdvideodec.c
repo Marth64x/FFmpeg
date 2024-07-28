@@ -367,6 +367,14 @@ static int dvdvideo_menu_open(AVFormatContext *s, DVDVideoPlaybackState *state)
     if (c->opt_menu_vts > 0)
         state->in_vts    = 1;
 
+    if (c->opt_trim && !dvdvideo_is_pgc_promising(s, state->pgc)) {
+        av_log(s, AV_LOG_ERROR, "Menu LU %d, VTS %d, PGC %d looks empty; "
+                                "if you want to try anyway, disable the trim option\n",
+                                c->opt_menu_lu, c->opt_menu_vts, c->opt_pgc);
+
+        return AVERROR_INVALIDDATA;
+    }
+
     if (!(state->vob_file = DVDOpenFile(c->dvdread, c->opt_menu_vts, DVD_READ_MENU_VOBS))) {
         av_log(s, AV_LOG_ERROR, !c->opt_menu_vts ?
                                 "Unable to open main menu VOB (VIDEO_TS.VOB)\n" :
@@ -527,7 +535,7 @@ static int dvdvideo_play_open(AVFormatContext *s, DVDVideoPlaybackState *state)
         goto end_dvdnav_error;
     }
 
-    if (c->opt_pgc > 0 && c->opt_pg > 0) {
+    if (c->opt_pgc > 0) {
         if (dvdnav_program_play(state->dvdnav, c->opt_title, c->opt_pgc, c->opt_pg) != DVDNAV_STATUS_OK) {
             av_log(s, AV_LOG_ERROR, "Unable to start playback at title %d, PGC %d, PG %d\n",
                                     c->opt_title, c->opt_pgc, c->opt_pg);
@@ -893,8 +901,8 @@ static int dvdvideo_chapters_setup_preindex(AVFormatContext *s)
 {
     DVDVideoDemuxContext *c = s->priv_data;
 
-    int ret = 0, interrupt = 0;
-    int nb_chapters = 0, last_ptt = c->opt_chapter_start;
+    int ret, partn, last_partn;
+    int interrupt = 0, nb_chapters = 0;
     uint64_t cur_chapter_offset = 0, cur_chapter_duration = 0;
     DVDVideoPlaybackState state = {0};
 
@@ -902,27 +910,38 @@ static int dvdvideo_chapters_setup_preindex(AVFormatContext *s)
     int is_nav_packet;
 
     if (c->opt_chapter_start == c->opt_chapter_end)
-        return ret;
+        return 0;
 
-    if ((ret = dvdvideo_play_open(s, &state)) < 0)
-        return ret;
+    if (c->opt_menu) {
+        if ((ret = dvdvideo_menu_open(s, &state)) < 0)
+            return ret;
+        last_partn = state.celln;
+    } else {
+        if ((ret = dvdvideo_play_open(s, &state)) < 0)
+            return ret;
+        last_partn = c->opt_chapter_start;
+    }
 
     if (state.pgc->nr_of_programs == 1)
         goto end_close;
 
-    av_log(s, AV_LOG_INFO,
-           "Indexing chapter markers, this will take a long time. Please wait...\n");
+    av_log(s, AV_LOG_INFO, "Indexing chapter markers, this may take a long time. Please wait...\n");
 
     while (!(interrupt = ff_check_interrupt(&s->interrupt_callback))) {
-        ret = dvdvideo_play_next_ps_block(s, &state, nav_buf, DVDVIDEO_BLOCK_SIZE,
-                                          &is_nav_packet);
+        if (c->opt_menu)
+            ret = dvdvideo_menu_next_ps_block(s, &state, nav_buf, DVDVIDEO_BLOCK_SIZE, &is_nav_packet);
+        else
+            ret = dvdvideo_play_next_ps_block(s, &state, nav_buf, DVDVIDEO_BLOCK_SIZE, &is_nav_packet);
+
         if (ret < 0 && ret != AVERROR_EOF)
             goto end_close;
 
         if (!is_nav_packet && ret != AVERROR_EOF)
             continue;
 
-        if (state.ptt == last_ptt) {
+        partn = c->opt_menu ? state.celln : state.ptt;
+
+        if (partn == last_partn) {
             cur_chapter_duration += state.vobu_duration;
             /* ensure we add the last chapter */
             if (ret != AVERROR_EOF)
@@ -941,7 +960,7 @@ static int dvdvideo_chapters_setup_preindex(AVFormatContext *s)
 
         cur_chapter_offset += cur_chapter_duration;
         cur_chapter_duration = state.vobu_duration;
-        last_ptt = state.ptt;
+        last_partn = partn;
 
         if (ret == AVERROR_EOF)
             break;
@@ -961,7 +980,10 @@ static int dvdvideo_chapters_setup_preindex(AVFormatContext *s)
     ret = 0;
 
 end_close:
-    dvdvideo_play_close(s, &state);
+    if (c->opt_menu)
+        dvdvideo_menu_close(s, &state);
+    else
+        dvdvideo_play_close(s, &state);
 
     return ret;
 }
@@ -1512,47 +1534,47 @@ static int dvdvideo_read_header(AVFormatContext *s)
     int ret;
 
     if (c->opt_menu) {
-        if (c->opt_region               ||
-            c->opt_title > 1            ||
-            c->opt_preindex             ||
-            c->opt_chapter_start > 1    ||
+        if (c->opt_region            ||
+	    c->opt_title > 1 	     ||
+            c->opt_chapter_start > 1 ||
             c->opt_chapter_end > 0) {
-            av_log(s, AV_LOG_ERROR, "-menu is not compatible with the -region, -title, "
-                                    "-preindex, or -chapter_start/-chapter_end options\n");
+
+            av_log(s, AV_LOG_ERROR, "Menu mode does not use region, title, or chapter ranges\n");
+
             return AVERROR(EINVAL);
         }
 
         if (!c->opt_pgc) {
-            av_log(s, AV_LOG_ERROR, "If -menu is enabled, -pgc must be set to a non-zero value\n");
+            av_log(s, AV_LOG_ERROR, "Menu mode requires a PGC number\n");
 
             return AVERROR(EINVAL);
         }
 
         if (!c->opt_menu_lu) {
             av_log(s, AV_LOG_INFO, "Defaulting to menu language unit #1. "
-                                   "This is not always desirable, validation suggested.\n");
+                                   "This is not always the desired menu, validation suggested\n");
 
             c->opt_menu_lu = 1;
         }
 
-        if (!c->opt_pg) {
-            av_log(s, AV_LOG_INFO, "Defaulting to menu PG #1. "
-                                   "This is not always desirable, validation suggested.\n");
-
-            c->opt_pg = 1;
-        }
-
-        if ((ret = dvdvideo_ifo_open(s)) < 0                    ||
-            (ret = dvdvideo_menu_open(s, &c->play_state)) < 0   ||
-            (ret = dvdvideo_subdemux_open(s)) < 0               ||
-            (ret = dvdvideo_video_stream_setup(s)) < 0          ||
+        if ((ret = dvdvideo_ifo_open(s)) < 0                                         ||
+            (c->opt_preindex && (ret = dvdvideo_chapters_setup_preindex(s)) < 0)     ||
+            (ret = dvdvideo_menu_open(s, &c->play_state)) < 0                        ||
+            (ret = dvdvideo_subdemux_open(s)) < 0                                    ||
+            (ret = dvdvideo_video_stream_setup(s)) < 0                               ||
             (ret = dvdvideo_audio_stream_add_all(s)) < 0)
         return ret;
 
         return 0;
     }
 
-    if (c->opt_chapter_end != 0 && c->opt_chapter_start > c->opt_chapter_end) {
+    if (c->opt_pgc && (c->opt_chapter_start > 1 || c->opt_chapter_end > 0 || c->opt_preindex)) {
+        av_log(s, AV_LOG_ERROR, "PGC extraction is not compatible with chapter options\n");
+
+        return AVERROR(EINVAL);
+    }
+
+    if (!c->opt_pgc && (c->opt_chapter_end != 0 && c->opt_chapter_start > c->opt_chapter_end)) {
         av_log(s, AV_LOG_ERROR, "Chapter (PTT) range [%d, %d] is invalid\n",
                                 c->opt_chapter_start, c->opt_chapter_end);
 
@@ -1561,21 +1583,9 @@ static int dvdvideo_read_header(AVFormatContext *s)
 
     if (c->opt_title == 0) {
         av_log(s, AV_LOG_INFO, "Defaulting to title #1. "
-                               "This is not always the main feature, validation suggested.\n");
+                               "This is not always the main feature, validation suggested\n");
 
         c->opt_title = 1;
-    }
-
-    if (c->opt_pgc) {
-        if (c->opt_pg == 0) {
-            av_log(s, AV_LOG_ERROR, "Invalid coordinates. If -pgc is set, -pg must be set too.\n");
-
-            return AVERROR(EINVAL);
-        } else if (c->opt_chapter_start > 1 || c->opt_chapter_end > 0 || c->opt_preindex) {
-            av_log(s, AV_LOG_ERROR, "-pgc is not compatible with the -preindex or "
-                                    "-chapter_start/-chapter_end options\n");
-            return AVERROR(EINVAL);
-        }
     }
 
     if ((ret = dvdvideo_ifo_open(s)) < 0)
@@ -1751,8 +1761,8 @@ static const AVOption dvdvideo_options[] = {
     {"chapter_start",   "entry chapter (PTT) number",                               OFFSET(opt_chapter_start),  AV_OPT_TYPE_INT,    { .i64=1 },     1,          99,        AV_OPT_FLAG_DECODING_PARAM },
     {"menu",            "demux menu domain",                                        OFFSET(opt_menu),           AV_OPT_TYPE_BOOL,   { .i64=0 },     0,          1,         AV_OPT_FLAG_DECODING_PARAM },
     {"menu_lu",         "menu language unit (0=auto)",                              OFFSET(opt_menu_lu),        AV_OPT_TYPE_INT,    { .i64=0 },     0,          99,        AV_OPT_FLAG_DECODING_PARAM },
-    {"menu_vts",        "menu VTS (0=VMG main menu)",                               OFFSET(opt_menu_vts),       AV_OPT_TYPE_INT,    { .i64=0 },     0,          99,        AV_OPT_FLAG_DECODING_PARAM },
-    {"pg",              "entry PG number (0=auto)",                                 OFFSET(opt_pg),             AV_OPT_TYPE_INT,    { .i64=0 },     0,          255,       AV_OPT_FLAG_DECODING_PARAM },
+    {"menu_vts",        "menu VTS (0=VMG root menu)",                               OFFSET(opt_menu_vts),       AV_OPT_TYPE_INT,    { .i64=1 },     0,          99,        AV_OPT_FLAG_DECODING_PARAM },
+    {"pg",              "entry PG number when paired with PGC number",              OFFSET(opt_pg),             AV_OPT_TYPE_INT,    { .i64=1 },     1,          255,       AV_OPT_FLAG_DECODING_PARAM },
     {"pgc",             "entry PGC number (0=auto)",                                OFFSET(opt_pgc),            AV_OPT_TYPE_INT,    { .i64=0 },     0,          999,       AV_OPT_FLAG_DECODING_PARAM },
     {"preindex",        "enable for accurate chapter markers, slow (2-pass read)",  OFFSET(opt_preindex),       AV_OPT_TYPE_BOOL,   { .i64=0 },     0,          1,         AV_OPT_FLAG_DECODING_PARAM },
     {"region",          "playback region number (0=free)",                          OFFSET(opt_region),         AV_OPT_TYPE_INT,    { .i64=0 },     0,          8,         AV_OPT_FLAG_DECODING_PARAM },
