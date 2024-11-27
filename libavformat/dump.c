@@ -552,6 +552,8 @@ static void dump_sidedata(void *ctx, const AVPacketSideData *side_data, int nb_s
 
 static void dump_disposition(int disposition, int log_level)
 {
+    if (disposition & AV_DISPOSITION_CAPTIONS_EIA608)
+        av_log(NULL, log_level, " (Closed Captions)");
     if (disposition & AV_DISPOSITION_DEFAULT)
         av_log(NULL, log_level, " (default)");
     if (disposition & AV_DISPOSITION_DUB)
