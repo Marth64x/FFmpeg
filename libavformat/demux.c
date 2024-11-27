@@ -2976,6 +2976,9 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
                 st->sample_aspect_ratio = av_mul_q(sti->display_aspect_ratio,
                                                    hw_ratio);
             }
+
+           if (!!(sti->avctx->properties & FF_CODEC_PROPERTY_CLOSED_CAPTIONS))
+               st->disposition |= AV_DISPOSITION_CAPTIONS_EIA608;
         } else if (avctx->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (!avctx->bits_per_coded_sample)
                 avctx->bits_per_coded_sample =
