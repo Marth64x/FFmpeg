@@ -718,6 +718,10 @@ typedef struct AVIndexEntry {
  * Annex G/H, or HEVC Annex F).
  */
 #define AV_DISPOSITION_MULTILAYER           (1 << 21)
+/**
+ * The video stream contains embedded EIA-608/CEA-708 Closed Captions.
+ */
+#define AV_DISPOSITION_CAPTIONS_EIA608      (1 << 22)
 
 /**
  * @return The AV_DISPOSITION_* flag corresponding to disp or a negative error
