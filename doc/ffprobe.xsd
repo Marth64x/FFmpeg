@@ -256,6 +256,7 @@
     <xsd:attribute name="dependent"        type="xsd:int" use="required" />
     <xsd:attribute name="still_image"      type="xsd:int" use="required" />
     <xsd:attribute name="multilayer"       type="xsd:int" use="required" />
+    <xsd:attribute name="captions_eia608"  type="xsd:int" use="required" />
   </xsd:complexType>
 
   <xsd:complexType name="streamType">
