@@ -647,8 +647,6 @@ void avcodec_string(char *buf, int buf_size, AVCodecContext *enc, int encode)
         if (encode) {
             av_bprintf(&bprint, ", q=%d-%d", enc->qmin, enc->qmax);
         } else {
-            if (enc->properties & FF_CODEC_PROPERTY_CLOSED_CAPTIONS)
-                av_bprintf(&bprint, ", Closed Captions");
             if (enc->properties & FF_CODEC_PROPERTY_FILM_GRAIN)
                 av_bprintf(&bprint, ", Film Grain");
             if (enc->properties & FF_CODEC_PROPERTY_LOSSLESS)
