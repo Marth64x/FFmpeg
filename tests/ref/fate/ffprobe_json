@@ -574,7 +574,8 @@
                 "metadata": 0,
                 "dependent": 0,
                 "still_image": 0,
-                "multilayer": 0
+                "multilayer": 0,
+                "captions_eia608": 0
             },
             "tags": {
                 "encoder": "Lavc pcm_s16le",
@@ -591,8 +592,6 @@
             "height": 240,
             "coded_width": 320,
             "coded_height": 240,
-            "closed_captions": 0,
-            "film_grain": 0,
             "has_b_frames": 0,
             "sample_aspect_ratio": "1:1",
             "display_aspect_ratio": "4:3",
@@ -625,7 +624,8 @@
                 "metadata": 0,
                 "dependent": 0,
                 "still_image": 0,
-                "multilayer": 0
+                "multilayer": 0,
+                "captions_eia608": 0
             },
             "tags": {
                 "encoder": "Lavc rawvideo",
@@ -643,8 +643,6 @@
             "height": 100,
             "coded_width": 100,
             "coded_height": 100,
-            "closed_captions": 0,
-            "film_grain": 0,
             "has_b_frames": 0,
             "sample_aspect_ratio": "1:1",
             "display_aspect_ratio": "1:1",
@@ -677,7 +675,8 @@
                 "metadata": 0,
                 "dependent": 0,
                 "still_image": 0,
-                "multilayer": 0
+                "multilayer": 0,
+                "captions_eia608": 0
             },
             "tags": {
                 "encoder": "Lavc rawvideo"
